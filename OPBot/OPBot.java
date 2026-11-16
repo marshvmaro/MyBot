@@ -17,803 +17,756 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
-/**
- * JosiahBot 5.0
- *
- *  RADAR     : width lock in 1v1. In melee it locks the target and does a full sweep every so often,
- *              so the target is tracked closely while everyone else is still seen.
- *  TARGETING : four guns, auto-selected by virtual-bullet scoring:
- *                0 head-on, 1 linear, 2 circular, 3 GUESS-FACTOR (statistical).
- *              The guess-factor gun now uses FOUR stat buffers (different situations and memory lengths)
- *              that vote together, and it never aims outside the arena.
- *  MOVEMENT  : 1v1  -> WAVE SURFING. It detects enemy shots (energy drops), tracks the "wave" each bullet
- *                      makes, remembers where it got hit, and drives to the safer side of every incoming wave.
- *              melee -> MINIMUM-RISK movement. It samples points around itself and drives to the safest one
- *                      (far from enemies, off the walls and out of corners).
- *  FIRE      : power depends on distance and energy, and never wastes more than a kill shot needs.
- *
- * ANGLES: 0 = east, 90 = north, turning LEFT makes the angle bigger.
- * ORBIT : orbitDir +1 = circle the enemy counter-clockwise (our angle around it grows), -1 = clockwise.
- */
-public class OPBot extends Bot {
+public class OPBot extends Bot { // our bot, extends the tank royale base class
 
     private static final double BOT_HALF = 18.0;     // bots are 36x36
-    private static final int GUNS = 4;
-    private static final int BINS = 31;              // guess-factor bins
-    private static final int CENTER = BINS / 2;
+    private static final int GUNS = 4;               // how many virtual guns we run
+    private static final int BINS = 31;              // guess factor bins
+    private static final int CENTER = BINS / 2;      // middle bin, guess factor zero
 
-    // ---- tuning knobs ----
-    private static final double PASS_WEIGHT = 0.15;  // surf stats: how much a wave that MISSED us counts
-    private static final int WAVE_OFFSET = -1;       // timing calibration: measured against real hits in Tank Royale 1.4.0
+    // tuning knobs
+    private static final double PASS_WEIGHT = 0.15;  // how much a wave that missed us counts in surf stats
+    private static final int WAVE_OFFSET = -1;       // timing fix, measured against real hits in tank royale 1.4.0
 
-    // ---- target tracking ----
-    private int targetId = -1;
-    private double tx, ty, tDir, tSpeed, tEnergy;
-    private double tTurnRate = 0;
-    private double prevDir = 0;
-    private int lastScanTurn = -100;
-    private int lastLatDir = 1;                      // enemy's last non-zero sideways direction
-    private int lastChangeTurn = 0;                  // when the enemy last changed direction / speed a lot
+    // target tracking
+    private int targetId = -1;                       // id of who were shooting at, -1 for nobody
+    private double tx, ty, tDir, tSpeed, tEnergy;    // target x y heading speed and energy
+    private double tTurnRate = 0;                    // how fast the target is turning per tick
+    private double prevDir = 0;                      // target heading at the last scan
+    private int lastScanTurn = -100;                 // turn we last scanned the target
+    private int lastLatDir = 1;                      // enemys last nonzero sideways direction
+    private int lastChangeTurn = 0;                  // last time enemy changed direction or speed a lot
 
-    // ---- enemy shot detection (1v1 surfing) ----
+    // enemy shot detection for 1v1 surfing
     private int scanTurn = -100;                     // turn of the newest scan of the target
-    private int prevScanTurn = -100;
-    private double prevEnergy = 100;
+    private int prevScanTurn = -100;                 // turn of the scan before that
+    private double prevEnergy = 100;                 // target energy at the previous scan
     private double pTx, pTy;                         // target position at the previous scan
     private double pMeX, pMeY;                       // our position at the previous scan
     private int myLatDirPrev = 1, myLatDir = 1;      // our sideways direction relative to the enemy
     private double dmgDealt = 0, gainFromHit = 0;    // energy changes explained by bullet hits
-    private int lastCollisionTurn = -100;
+    private int lastCollisionTurn = -100;            // last turn we bumped into a bot
 
-    // ---- every bot we've seen: id -> {x, y, turnSeen, energy} ----
-    private final Map<Integer, double[]> bots = new HashMap<>();
+    // every bot weve seen, id to x y turnSeen energy
+    private final Map<Integer, double[]> bots = new HashMap<>(); // lookup of last known bot info
 
-    // ---- movement ----
-    private int orbitDir = 1;
-    private int flipCooldown = 0;
-    private double prefDist = 380;
+    // movement
+    private int orbitDir = 1;                        // which way were circling
+    private int flipCooldown = 0;                    // ticks before we can flip direction again
+    private double prefDist = 380;                   // distance we like to keep from the enemy
     private double destX, destY;                     // melee destination
-    private int destTurn = -100;
+    private int destTurn = -100;                     // turn we picked the current destination
 
-    // ---- radar (melee) ----
-    private int sweepUntil = -1;
-    private int lastSweepEnd = 0;
+    // radar for melee
+    private int sweepUntil = -1;                     // keep sweeping until this turn
+    private int lastSweepEnd = 0;                    // turn the last sweep ended
 
-    // ---- enemy waves + surf stats ----
-    private static class EWave {
-        double ox, oy, speed, directAngle, mea;
-        int fireTurn, latDir;
+    // enemy waves and surf stats
+    private static class EWave { // one enemy bullet wave
+        double ox, oy, speed, directAngle, mea; // origin, speed, angle straight at us, max escape angle
+        int fireTurn, latDir; // when it was fired and our sideways direction then
     }
-    private final List<EWave> eWaves = new ArrayList<>();
-    private final double[] surf = new double[BINS];
+    private final List<EWave> eWaves = new ArrayList<>(); // waves currently in the air
+    private final double[] surf = new double[BINS];       // danger per bin from where weve been hit
 
-    // ---- virtual guns ----
-    private final double[] gunScore = {0.0, 0.0, 0.01, 0.0};
-    private final List<VBullet> vbullets = new ArrayList<>();
+    // virtual guns
+    private final double[] gunScore = {0.0, 0.0, 0.01, 0.0}; // running hit score per gun, circular gets a tiny head start
+    private final List<VBullet> vbullets = new ArrayList<>(); // virtual bullets waiting to be scored
 
-    // guess-factor buffers (see segments() below) and how fast each one forgets
-    private final double[][][] gf = {
+    // guess factor buffers (see segments below) and how fast each one forgets
+    private final double[][][] gf = { // all the stat buffers
             new double[16][BINS],   // 0: flight time x sideways speed
             new double[36][BINS],   // 1: sideways speed x wall room x acceleration
             new double[36][BINS],   // 2: flight time x advancing speed x time since change
             new double[1][BINS]     // 3: everything together, forgets fast
     };
-    private static final double[] GF_DECAY = {0.995, 0.99, 0.993, 0.97};
-    private static final double[] GF_WEIGHT = {1.0, 1.0, 1.0, 0.5};
+    private static final double[] GF_DECAY = {0.995, 0.99, 0.993, 0.97}; // forgetting rate per buffer
+    private static final double[] GF_WEIGHT = {1.0, 1.0, 1.0, 0.5};      // vote weight per buffer
 
-    private static class VBullet {
-        double ox, oy, speed;
-        int fireTurn;
-        double[] angles = new double[GUNS];
-        double abs;
-        int latDir;
-        double mea;
-        int[] seg = new int[4];
+    private static class VBullet { // a pretend bullet for each gun
+        double ox, oy, speed; // where it started and how fast it goes
+        int fireTurn; // turn it was fired
+        double[] angles = new double[GUNS]; // where each gun aimed
+        double abs; // direct angle to the enemy at fire time
+        int latDir; // enemy sideways direction at fire time
+        double mea; // max escape angle for this bullet speed
+        int[] seg = new int[4]; // which segment of each buffer applied
     }
 
-    public static void main(String[] args) {
-        new OPBot().start();
+    public static void main(String[] args) { // program entry point
+        new OPBot().start(); // make the bot and connect to the server
     }
 
-    OPBot() {
-        super(BotInfo.builder()
-                .setName("OPBot")
-                .setVersion("1.0")
-                .addAuthor("me")
-                .build());
+    OPBot() { // constructor
+        super(BotInfo.builder() // hand bot info to the base class
+                .setName("OPBot") // bot name
+                .setVersion("1.0") // bot version
+                .addAuthor("me") // bot author
+                .build()); // finish building the info
     }
 
     @Override
-    public void run() {
-        setAdjustGunForBodyTurn(true);
-        setAdjustRadarForGunTurn(true);
-        setAdjustRadarForBodyTurn(true);
+    public void run() { // called at the start of every round
+        setAdjustGunForBodyTurn(true); // gun turns independent of the body
+        setAdjustRadarForGunTurn(true); // radar turns independent of the gun
+        setAdjustRadarForBodyTurn(true); // radar turns independent of the body
 
-        setBodyColor(Color.fromRgb(0, 0, 0));
-        setBulletColor(Color.fromRgb(0, 0, 0));
-        setTurretColor(Color.fromRgb(0, 0, 0));
-        setScanColor(Color.fromRgb(28, 101, 27));
-        setRadarColor(Color.fromRgb(28, 101, 27));
+        setBodyColor(Color.fromRgb(0, 0, 0)); // black body
+        setBulletColor(Color.fromRgb(0, 0, 0)); // black bullets
+        setTurretColor(Color.fromRgb(0, 0, 0)); // black turret
+        setScanColor(Color.fromRgb(28, 101, 27)); // green scan arc
+        setRadarColor(Color.fromRgb(28, 101, 27)); // green radar
 
-        // Reset per-round state (gunScore, gf and surf are kept on purpose so we keep learning)
-        targetId = -1;
-        lastScanTurn = -100;
-        scanTurn = -100;
-        prevScanTurn = -100;
-        orbitDir = Math.random() < 0.5 ? 1 : -1;
-        flipCooldown = 0;
-        dmgDealt = 0;
-        gainFromHit = 0;
-        lastCollisionTurn = -100;
-        sweepUntil = -1;
-        lastSweepEnd = 0;
-        destTurn = -100;
-        bots.clear();
-        vbullets.clear();
-        eWaves.clear();
-        setMaxSpeed(8);
+        // reset per round stuff, gunScore gf and surf stay so we keep learning
+        targetId = -1; // no target yet
+        lastScanTurn = -100; // pretend we scanned long ago
+        scanTurn = -100; // same for the newest scan
+        prevScanTurn = -100; // and the one before
+        orbitDir = Math.random() < 0.5 ? 1 : -1; // random starting orbit direction
+        flipCooldown = 0; // allow flipping right away
+        dmgDealt = 0; // clear damage bookkeeping
+        gainFromHit = 0; // clear energy gain bookkeeping
+        lastCollisionTurn = -100; // no recent collision
+        sweepUntil = -1; // no sweep in progress
+        lastSweepEnd = 0; // reset sweep timer
+        destTurn = -100; // force a new melee destination
+        bots.clear(); // forget all known bots
+        vbullets.clear(); // drop virtual bullets
+        eWaves.clear(); // drop enemy waves
+        setMaxSpeed(8); // full speed
 
-        while (isRunning()) {
-            if (flipCooldown > 0) flipCooldown--;
+        while (isRunning()) { // main loop, one pass per tick
+            if (flipCooldown > 0) flipCooldown--; // tick down the flip cooldown
 
-            doRadar();
-            if (getTurnNumber() - lastScanTurn > 20) {
-                targetId = -1;   // target is stale
+            doRadar(); // point the radar
+            if (getTurnNumber() - lastScanTurn > 20) { // havent seen the target in a while
+                targetId = -1;   // target went stale
             }
 
-            processEnemyShots();
-            updateWaves();
-            doMovement();
-            go();
+            processEnemyShots(); // check if the enemy fired
+            updateWaves(); // move and clean up waves
+            doMovement(); // decide where to drive
+            go(); // send all the commands for this tick
         }
     }
 
-    // =====================================================================
-    //  RADAR
-    // =====================================================================
-
-    private void doRadar() {
-        int now = getTurnNumber();
-        boolean lost = now - lastScanTurn > 2;
-        if (getEnemyCount() > 1) {
-            if (now < sweepUntil || targetId == -1 || lost) {
-                setTurnRadarLeft(Double.POSITIVE_INFINITY);
-            } else if (now - lastSweepEnd > 25) {
+    private void doRadar() { // radar control each tick
+        int now = getTurnNumber(); // current turn
+        boolean lost = now - lastScanTurn > 2; // target slipped out of the beam
+        if (getEnemyCount() > 1) { // melee
+            if (now < sweepUntil || targetId == -1 || lost) { // sweeping or no good lock
+                setTurnRadarLeft(Double.POSITIVE_INFINITY); // spin the radar
+            } else if (now - lastSweepEnd > 25) { // been a while since a full sweep
                 sweepUntil = now + 9;          // one full turn takes 8 ticks
-                lastSweepEnd = now + 9;
-                setTurnRadarLeft(Double.POSITIVE_INFINITY);
+                lastSweepEnd = now + 9; // remember when this sweep ends
+                setTurnRadarLeft(Double.POSITIVE_INFINITY); // start spinning
             }
-        } else if (lost) {
-            setTurnRadarLeft(Double.POSITIVE_INFINITY);
+        } else if (lost) { // 1v1 and we lost the enemy
+            setTurnRadarLeft(Double.POSITIVE_INFINITY); // spin to find them again
         }
     }
 
-    // =====================================================================
-    //  ENEMY SHOTS -> WAVES
-    // =====================================================================
-
-    /** Runs once per tick after the events: did the target just fire? If so, start a wave. */
+    // runs once a tick after the events, did the target just fire, if so start a wave
     private void processEnemyShots() {
-        int now = getTurnNumber();
-        if (targetId == -1 || scanTurn != now) return;
+        int now = getTurnNumber(); // current turn
+        if (targetId == -1 || scanTurn != now) return; // need a fresh scan of the target
 
-        double expected = prevEnergy - dmgDealt + gainFromHit;
-        double drop = expected - tEnergy;
-        dmgDealt = 0;
-        gainFromHit = 0;
+        double expected = prevEnergy - dmgDealt + gainFromHit; // energy we expect after known hits
+        double drop = expected - tEnergy; // unexplained drop, probably a shot
+        dmgDealt = 0; // reset for next tick
+        gainFromHit = 0; // reset for next tick
 
-        boolean collided = now - lastCollisionTurn <= 1;
-        if (drop >= 0.09 && drop <= 3.01 && !collided && scanTurn - prevScanTurn <= 2) {
-            if (getEnemyCount() == 1) {
-                spawnWave(drop);
-            } else if (Math.random() < 0.8) {
-                flipDirection(false);
+        boolean collided = now - lastCollisionTurn <= 1; // ramming also costs energy
+        if (drop >= 0.09 && drop <= 3.01 && !collided && scanTurn - prevScanTurn <= 2) { // looks like a real shot
+            if (getEnemyCount() == 1) { // 1v1
+                spawnWave(drop); // track the bullet as a wave
+            } else if (Math.random() < 0.8) { // melee
+                flipDirection(false); // just dodge by changing direction
             }
         }
 
-        prevEnergy = tEnergy;
-        prevScanTurn = scanTurn;
-        pTx = tx;
-        pTy = ty;
-        pMeX = getX();
-        pMeY = getY();
-        myLatDirPrev = myLatDir;
-        double lat = getSpeed() * Math.sin(Math.toRadians(getDirection() - angleTo(tx, ty, getX(), getY())));
-        if (Math.abs(lat) > 0.1) myLatDir = lat > 0 ? 1 : -1;
+        prevEnergy = tEnergy; // save energy for next time
+        prevScanTurn = scanTurn; // save scan turn for next time
+        pTx = tx; // save target x
+        pTy = ty; // save target y
+        pMeX = getX(); // save our x
+        pMeY = getY(); // save our y
+        myLatDirPrev = myLatDir; // shift our sideways direction history
+        double lat = getSpeed() * Math.sin(Math.toRadians(getDirection() - angleTo(tx, ty, getX(), getY()))); // our sideways speed vs the enemy
+        if (Math.abs(lat) > 0.1) myLatDir = lat > 0 ? 1 : -1; // only update when were actually moving sideways
     }
 
-    private void spawnWave(double power) {
-        EWave w = new EWave();
-        w.ox = tx;
-        w.oy = ty;
-        w.speed = 20 - 3 * power;
-        w.fireTurn = scanTurn + WAVE_OFFSET;
-        w.directAngle = angleTo(w.ox, w.oy, pMeX, pMeY);
-        w.latDir = myLatDirPrev;
-        w.mea = Math.toDegrees(Math.asin(8.0 / w.speed));
-        eWaves.add(w);
+    private void spawnWave(double power) { // make a wave from a detected shot
+        EWave w = new EWave(); // new wave
+        w.ox = tx; // starts at the enemy x
+        w.oy = ty; // starts at the enemy y
+        w.speed = 20 - 3 * power; // bullet speed formula
+        w.fireTurn = scanTurn + WAVE_OFFSET; // apply the timing fix
+        w.directAngle = angleTo(w.ox, w.oy, pMeX, pMeY); // angle straight at where we were
+        w.latDir = myLatDirPrev; // our sideways direction at fire time
+        w.mea = Math.toDegrees(Math.asin(8.0 / w.speed)); // max escape angle
+        eWaves.add(w); // start tracking it
     }
 
-    private double waveRadius(EWave w, int turn) {
-        return w.speed * (turn - w.fireTurn);
+    private double waveRadius(EWave w, int turn) { // how far the wave front has traveled
+        return w.speed * (turn - w.fireTurn); // speed times age
     }
 
-    /** Drop waves that already passed us (learning a little from the ones that missed). */
+    // drop waves that already passed us, learn a little from the ones that missed
     private void updateWaves() {
-        int now = getTurnNumber();
-        Iterator<EWave> it = eWaves.iterator();
-        while (it.hasNext()) {
-            EWave w = it.next();
-            double d = Math.hypot(getX() - w.ox, getY() - w.oy);
-            if (waveRadius(w, now) > d + BOT_HALF + 4) {
-                if (PASS_WEIGHT > 0) recordSurf(w, getX(), getY(), PASS_WEIGHT);
-                it.remove();
+        int now = getTurnNumber(); // current turn
+        Iterator<EWave> it = eWaves.iterator(); // iterator so we can remove while looping
+        while (it.hasNext()) { // go through every wave
+            EWave w = it.next(); // next wave
+            double d = Math.hypot(getX() - w.ox, getY() - w.oy); // distance from wave origin to us
+            if (waveRadius(w, now) > d + BOT_HALF + 4) { // wave front fully past us
+                if (PASS_WEIGHT > 0) recordSurf(w, getX(), getY(), PASS_WEIGHT); // note that this spot was safe-ish
+                it.remove(); // done with this wave
             }
         }
     }
 
-    private double gfOf(EWave w, double px, double py) {
-        double offset = norm(angleTo(w.ox, w.oy, px, py) - w.directAngle);
-        return clamp(offset * w.latDir / w.mea, -1, 1);
+    private double gfOf(EWave w, double px, double py) { // guess factor of a point relative to a wave
+        double offset = norm(angleTo(w.ox, w.oy, px, py) - w.directAngle); // angle offset from direct
+        return clamp(offset * w.latDir / w.mea, -1, 1); // scale to -1..1 and fix the direction
     }
 
-    private void recordSurf(EWave w, double px, double py, double weight) {
-        int idx = (int) Math.round(gfOf(w, px, py) * CENTER + CENTER);
-        for (int b = 0; b < BINS; b++) {
-            double z = (b - idx) / 1.6;
-            surf[b] += weight * Math.exp(-0.5 * z * z);
+    private void recordSurf(EWave w, double px, double py, double weight) { // add a hit or pass to surf stats
+        int idx = (int) Math.round(gfOf(w, px, py) * CENTER + CENTER); // bin where it happened
+        for (int b = 0; b < BINS; b++) { // spread over nearby bins
+            double z = (b - idx) / 1.6; // distance from the center bin
+            surf[b] += weight * Math.exp(-0.5 * z * z); // gaussian bump
         }
     }
 
-    // =====================================================================
-    //  MOVEMENT
-    // =====================================================================
-
-    private void doMovement() {
-        if (targetId == -1) {
-            // No target yet: cruise in a wide arc while the radar finds someone
-            double travel = smooth(getX(), getY(), getDirection() + 15 * orbitDir, orbitDir);
-            driveToward(travel, 150);
-        } else if (getEnemyCount() == 1) {
-            surfMove();
-        } else {
-            meleeMove();
+    private void doMovement() { // pick the movement style
+        if (targetId == -1) { // nobody to fight yet
+            // no target yet so cruise in a wide arc while the radar finds someone
+            double travel = smooth(getX(), getY(), getDirection() + 15 * orbitDir, orbitDir); // gentle curve staying in bounds
+            driveToward(travel, 150); // drive along it
+        } else if (getEnemyCount() == 1) { // 1v1
+            surfMove(); // wave surf
+        } else { // melee
+            meleeMove(); // minimum risk
         }
     }
 
-    // ---------- 1v1: wave surfing ----------
+    // 1v1 wave surfing
 
-    private void surfMove() {
-        double pref = prefDist;
-        if (getEnergy() < tEnergy - 30) pref += 100;
+    private void surfMove() { // 1v1 movement
+        double pref = prefDist; // base preferred distance
+        if (getEnergy() < tEnergy - 30) pref += 100; // back off when were way behind on energy
 
-        int dir = orbitDir;
-        List<EWave> ws = upcomingWaves(2);
-        if (!ws.isEmpty()) {
-            double dPlus = predictDanger(ws, 1, pref);
-            double dMinus = predictDanger(ws, -1, pref);
-            if (dPlus < dMinus - 1e-9) dir = 1;
-            else if (dMinus < dPlus - 1e-9) dir = -1;
-            orbitDir = dir;
-        } else if (flipCooldown == 0 && Math.random() < 0.03) {
-            flipDirection(false);   // nothing incoming: still change direction now and then
-            dir = orbitDir;
+        int dir = orbitDir; // start with the current direction
+        List<EWave> ws = upcomingWaves(2); // the next two waves
+        if (!ws.isEmpty()) { // something incoming
+            double dPlus = predictDanger(ws, 1, pref); // danger going counter clockwise
+            double dMinus = predictDanger(ws, -1, pref); // danger going clockwise
+            if (dPlus < dMinus - 1e-9) dir = 1; // counter clockwise is safer
+            else if (dMinus < dPlus - 1e-9) dir = -1; // clockwise is safer
+            orbitDir = dir; // commit to it
+        } else if (flipCooldown == 0 && Math.random() < 0.03) { // nothing incoming, small random chance
+            flipDirection(false);   // nothing incoming but still switch it up now and then
+            dir = orbitDir; // use the new direction
         }
 
-        double travel = orbitAngle(getX(), getY(), tx, ty, dir, pref);
-        travel = smooth(getX(), getY(), travel, dir);
-        driveToward(travel, 120);
+        double travel = orbitAngle(getX(), getY(), tx, ty, dir, pref); // heading to circle the enemy
+        travel = smooth(getX(), getY(), travel, dir); // keep it inside the arena
+        driveToward(travel, 120); // go
     }
 
-    /** The (up to n) waves that are still on their way, soonest first. */
+    // the (up to n) waves still on their way, soonest first
     private List<EWave> upcomingWaves(int n) {
-        int now = getTurnNumber();
-        List<EWave> out = new ArrayList<>(eWaves);
-        out.sort((a, b) -> Double.compare(timeLeft(a, now), timeLeft(b, now)));
-        return out.size() > n ? new ArrayList<>(out.subList(0, n)) : out;
+        int now = getTurnNumber(); // current turn
+        List<EWave> out = new ArrayList<>(eWaves); // copy so we can sort
+        out.sort((a, b) -> Double.compare(timeLeft(a, now), timeLeft(b, now))); // soonest first
+        return out.size() > n ? new ArrayList<>(out.subList(0, n)) : out; // trim to n
     }
 
-    private double timeLeft(EWave w, int now) {
-        double d = Math.hypot(getX() - w.ox, getY() - w.oy);
-        return (d - waveRadius(w, now)) / w.speed;
+    private double timeLeft(EWave w, int now) { // ticks until a wave reaches us
+        double d = Math.hypot(getX() - w.ox, getY() - w.oy); // distance to wave origin
+        return (d - waveRadius(w, now)) / w.speed; // gap left divided by speed
     }
 
-    /** Direction to drive to circle (ex, ey) in direction dir, nudged toward/away from the preferred distance. */
+    // direction to drive to circle the enemy in direction dir, nudged toward or away from the preferred distance
     private double orbitAngle(double x, double y, double ex, double ey, int dir, double pref) {
         double theta = angleTo(ex, ey, x, y);      // from the enemy to us
-        double d = Math.hypot(x - ex, y - ey);
-        double k = clamp((d - pref) / 5.0, -45, 45);   // too far: lean toward the enemy
-        return theta + dir * (90 + k);
+        double d = Math.hypot(x - ex, y - ey); // current distance
+        double k = clamp((d - pref) / 5.0, -45, 45);   // too far means lean toward the enemy
+        return theta + dir * (90 + k); // perpendicular plus the lean
     }
 
-    /**
-     * Pretend to keep orbiting in direction dir (using the real turn / acceleration limits) and see where we
-     * would be when each wave reaches us. The danger is how often we have been hit at that spot before.
-     */
+    // pretend we keep orbiting in direction dir with the real turn and accel limits
+    // and see where we end up when each wave hits
+    // danger is how often weve been hit at that spot before
     private double predictDanger(List<EWave> ws, int dir, double pref) {
-        int now = getTurnNumber();
-        EWave w0 = ws.get(0);
-        double px = getX(), py = getY(), ph = getDirection(), pv = getSpeed();
-        boolean[] done = new boolean[ws.size()];
-        int remaining = ws.size();
-        double total = 0;
-        double lo = BOT_HALF, hiX = getArenaWidth() - BOT_HALF, hiY = getArenaHeight() - BOT_HALF;
+        int now = getTurnNumber(); // current turn
+        EWave w0 = ws.get(0); // orbit around the first waves origin
+        double px = getX(), py = getY(), ph = getDirection(), pv = getSpeed(); // simulated position heading and velocity
+        boolean[] done = new boolean[ws.size()]; // which waves have reached us in the sim
+        int remaining = ws.size(); // waves still to reach us
+        double total = 0; // accumulated danger
+        double lo = BOT_HALF, hiX = getArenaWidth() - BOT_HALF, hiY = getArenaHeight() - BOT_HALF; // arena limits for our center
 
-        for (int t = 1; t <= 160 && remaining > 0; t++) {
-            double want = smooth(px, py, orbitAngle(px, py, w0.ox, w0.oy, dir, pref), dir);
-            double turn = norm(want - ph);
-            int md = 1;
-            if (Math.abs(turn) > 90) {
-                turn = norm(turn - 180);
-                md = -1;
+        for (int t = 1; t <= 160 && remaining > 0; t++) { // step the sim forward tick by tick
+            double want = smooth(px, py, orbitAngle(px, py, w0.ox, w0.oy, dir, pref), dir); // where wed like to head
+            double turn = norm(want - ph); // turn needed
+            int md = 1; // move direction, 1 forward
+            if (Math.abs(turn) > 90) { // quicker to reverse
+                turn = norm(turn - 180); // turn the other way
+                md = -1; // drive backward
             }
-            double maxT = 10 - 0.75 * Math.abs(pv);
-            ph = norm(ph + clamp(turn, -maxT, maxT));
-            pv += (pv * md < 0) ? 2 * md : md;
-            pv = clamp(pv, -8, 8);
-            px = clamp(px + Math.cos(Math.toRadians(ph)) * pv, lo, hiX);
-            py = clamp(py + Math.sin(Math.toRadians(ph)) * pv, lo, hiY);
+            double maxT = 10 - 0.75 * Math.abs(pv); // max turn rate depends on speed
+            ph = norm(ph + clamp(turn, -maxT, maxT)); // apply the turn
+            pv += (pv * md < 0) ? 2 * md : md; // braking is faster than speeding up
+            pv = clamp(pv, -8, 8); // speed limit
+            px = clamp(px + Math.cos(Math.toRadians(ph)) * pv, lo, hiX); // move x
+            py = clamp(py + Math.sin(Math.toRadians(ph)) * pv, lo, hiY); // move y
 
-            for (int i = 0; i < ws.size(); i++) {
-                if (done[i]) continue;
-                EWave w = ws.get(i);
-                if (Math.hypot(px - w.ox, py - w.oy) <= waveRadius(w, now + t)) {
-                    done[i] = true;
-                    remaining--;
-                    int idx = (int) Math.round(gfOf(w, px, py) * CENTER + CENTER);
-                    total += surf[idx] * (i == 0 ? 1.0 : 0.5);
+            for (int i = 0; i < ws.size(); i++) { // check each wave
+                if (done[i]) continue; // already handled
+                EWave w = ws.get(i); // this wave
+                if (Math.hypot(px - w.ox, py - w.oy) <= waveRadius(w, now + t)) { // wave has reached the simulated spot
+                    done[i] = true; // mark it
+                    remaining--; // one less to go
+                    int idx = (int) Math.round(gfOf(w, px, py) * CENTER + CENTER); // bin wed be in
+                    total += surf[idx] * (i == 0 ? 1.0 : 0.5); // add danger, later waves count less
                 }
             }
         }
-        return total;
+        return total; // lower is safer
     }
 
-    // ---------- melee: minimum risk ----------
+    // melee minimum risk
 
-    private void meleeMove() {
-        double x = getX(), y = getY();
-        int now = getTurnNumber();
-        if (now - destTurn > 14 || Math.hypot(destX - x, destY - y) < 25) {
-            pickDestination();
+    private void meleeMove() { // melee movement
+        double x = getX(), y = getY(); // our position
+        int now = getTurnNumber(); // current turn
+        if (now - destTurn > 14 || Math.hypot(destX - x, destY - y) < 25) { // destination old or reached
+            pickDestination(); // choose a new one
         }
-        double d = Math.hypot(destX - x, destY - y);
-        driveToward(angleTo(x, y, destX, destY), Math.max(20, Math.min(d, 150)));
+        double d = Math.hypot(destX - x, destY - y); // distance to destination
+        driveToward(angleTo(x, y, destX, destY), Math.max(20, Math.min(d, 150))); // head there
     }
 
-    private void pickDestination() {
-        double x = getX(), y = getY();
-        double best = Double.MAX_VALUE;
-        double bx = x, by = y;
-        double margin = 35;
-        for (int i = 0; i < 36; i++) {
-            double ang = Math.toRadians(i * 10 + Math.random() * 10);
-            double r = 70 + Math.random() * 110;
-            double px = x + Math.cos(ang) * r;
-            double py = y + Math.sin(ang) * r;
-            if (px < margin || px > getArenaWidth() - margin || py < margin || py > getArenaHeight() - margin) continue;
-            double risk = riskAt(px, py, x, y);
-            if (risk < best) {
-                best = risk;
-                bx = px;
-                by = py;
+    private void pickDestination() { // sample points and take the safest
+        double x = getX(), y = getY(); // our position
+        double best = Double.MAX_VALUE; // lowest risk so far
+        double bx = x, by = y; // best point, default to staying put
+        double margin = 35; // stay this far from the walls
+        for (int i = 0; i < 36; i++) { // 36 candidate points
+            double ang = Math.toRadians(i * 10 + Math.random() * 10); // spread around us with some jitter
+            double r = 70 + Math.random() * 110; // random distance
+            double px = x + Math.cos(ang) * r; // candidate x
+            double py = y + Math.sin(ang) * r; // candidate y
+            if (px < margin || px > getArenaWidth() - margin || py < margin || py > getArenaHeight() - margin) continue; // skip points near walls
+            double risk = riskAt(px, py, x, y); // score it
+            if (risk < best) { // safer than the best so far
+                best = risk; // new best risk
+                bx = px; // new best x
+                by = py; // new best y
             }
         }
-        destX = bx;
-        destY = by;
-        destTurn = getTurnNumber();
+        destX = bx; // set destination x
+        destY = by; // set destination y
+        destTurn = getTurnNumber(); // remember when we picked it
     }
 
-    private double riskAt(double px, double py, double x, double y) {
-        int now = getTurnNumber();
-        double risk = 0;
-        for (double[] b : bots.values()) {
+    private double riskAt(double px, double py, double x, double y) { // how dangerous is a point
+        int now = getTurnNumber(); // current turn
+        double risk = 0; // running total
+        for (double[] b : bots.values()) { // every known bot
             if (now - b[2] > 40) continue;                      // old info
-            double d2 = Math.max(400, (px - b[0]) * (px - b[0]) + (py - b[1]) * (py - b[1]));
-            double a1 = angleTo(b[0], b[1], x, y);
-            double a2 = angleTo(b[0], b[1], px, py);
+            double d2 = Math.max(400, (px - b[0]) * (px - b[0]) + (py - b[1]) * (py - b[1])); // squared distance with a floor
+            double a1 = angleTo(b[0], b[1], x, y); // angle from them to where we are now
+            double a2 = angleTo(b[0], b[1], px, py); // angle from them to the candidate
             double perp = 1 + Math.abs(Math.cos(Math.toRadians(a1 - a2)));  // moving toward them is worse than sideways
             double weight = 1 + b[3] / 50.0;                    // stronger enemies are scarier
-            risk += weight * perp * 90000 / d2;
+            risk += weight * perp * 90000 / d2; // closer means way riskier
         }
-        double edge = Math.min(Math.min(px, getArenaWidth() - px), Math.min(py, getArenaHeight() - py));
-        if (edge < 120) risk += (120 - edge) / 120 * 1.5;
-        double cx = Math.min(px, getArenaWidth() - px), cy = Math.min(py, getArenaHeight() - py);
+        double edge = Math.min(Math.min(px, getArenaWidth() - px), Math.min(py, getArenaHeight() - py)); // distance to nearest wall
+        if (edge < 120) risk += (120 - edge) / 120 * 1.5; // penalty for hugging walls
+        double cx = Math.min(px, getArenaWidth() - px), cy = Math.min(py, getArenaHeight() - py); // distance to nearest wall on each axis
         if (cx < 150 && cy < 150) risk += 2;                    // corners are traps
-        return risk + Math.random() * 0.05;
+        return risk + Math.random() * 0.05; // tiny noise to break ties
     }
 
-    // ---------- shared driving helpers ----------
+    // shared driving helpers
 
-    /** Turn the shortest way and drive forward or backward toward the travel direction. */
+    // turn the short way and drive forward or backward toward the travel direction
     private void driveToward(double travel, double distance) {
-        double delta = norm(travel - getDirection());
-        int dir = 1;
-        if (Math.abs(delta) > 90) {
-            delta = norm(delta - 180);
-            dir = -1;
+        double delta = norm(travel - getDirection()); // how far we need to turn
+        int dir = 1; // forward by default
+        if (Math.abs(delta) > 90) { // faster to go backward
+            delta = norm(delta - 180); // flip the turn
+            dir = -1; // reverse
         }
-        setTurnLeft(delta);
-        setForward(distance * dir);
+        setTurnLeft(delta); // queue the turn
+        setForward(distance * dir); // queue the move
     }
 
-    /**
-     * Rotate the travel direction (toward the enemy side, step by step) until the path ahead stays inside
-     * the arena. 'dir' is the orbit direction, so +dir turns toward the enemy.
-     */
+    // rotate the travel direction toward the enemy side bit by bit until the path ahead stays in the arena
+    // dir is the orbit direction so +dir turns toward the enemy
     private double smooth(double x, double y, double angle, int dir) {
-        for (int i = 0; i <= 60; i++) {
-            double a = angle + dir * i * 3;
-            if (insideField(x, y, a)) return a;
+        for (int i = 0; i <= 60; i++) { // up to 180 degrees of adjustment
+            double a = angle + dir * i * 3; // try turning 3 degrees more each time
+            if (insideField(x, y, a)) return a; // first safe angle wins
         }
-        return angle;
+        return angle; // nothing worked, use the original
     }
 
-    private boolean insideField(double fromX, double fromY, double angle) {
-        double look = 140;
-        double margin = 28;
-        double x = fromX + Math.cos(Math.toRadians(angle)) * look;
-        double y = fromY + Math.sin(Math.toRadians(angle)) * look;
-        return x > margin && x < getArenaWidth() - margin
-                && y > margin && y < getArenaHeight() - margin;
+    private boolean insideField(double fromX, double fromY, double angle) { // would we still be in the arena
+        double look = 140; // how far ahead we check
+        double margin = 28; // wall buffer
+        double x = fromX + Math.cos(Math.toRadians(angle)) * look; // look ahead x
+        double y = fromY + Math.sin(Math.toRadians(angle)) * look; // look ahead y
+        return x > margin && x < getArenaWidth() - margin // x inside the buffer
+                && y > margin && y < getArenaHeight() - margin; // y inside the buffer
     }
 
-    private void flipDirection(boolean force) {
-        if (force || flipCooldown == 0) {
-            orbitDir = -orbitDir;
-            flipCooldown = 10;
-            prefDist = 320 + Math.random() * 130;   // new preferred distance each time
+    private void flipDirection(boolean force) { // reverse the orbit
+        if (force || flipCooldown == 0) { // only when forced or cooled down
+            orbitDir = -orbitDir; // swap direction
+            flipCooldown = 10; // wait a bit before the next flip
+            prefDist = 320 + Math.random() * 130;   // new preferred distance every time
         }
     }
-
-    // =====================================================================
-    //  SCANNING, TARGETING, FIRING
-    // =====================================================================
 
     @Override
-    public void onScannedBot(ScannedBotEvent e) {
-        int id = e.getScannedBotId();
-        int now = getTurnNumber();
-        double dist = distanceTo(e.getX(), e.getY());
+    public void onScannedBot(ScannedBotEvent e) { // radar saw a bot
+        int id = e.getScannedBotId(); // who it is
+        int now = getTurnNumber(); // current turn
+        double dist = distanceTo(e.getX(), e.getY()); // how far away
 
-        bots.put(id, new double[]{e.getX(), e.getY(), now, e.getEnergy()});
+        bots.put(id, new double[]{e.getX(), e.getY(), now, e.getEnergy()}); // update the bot table
 
-        double currentTargetDist = (targetId == -1) ? Double.MAX_VALUE : distanceTo(tx, ty);
+        double currentTargetDist = (targetId == -1) ? Double.MAX_VALUE : distanceTo(tx, ty); // distance to our current target
 
-        // Pick the target: stick with it, unless there's none, someone is much closer,
-        // or someone is much weaker and not far away
-        boolean switchTarget = (targetId == -1);
-        if (!switchTarget && id != targetId) {
-            if (dist < currentTargetDist * 0.7) switchTarget = true;
-            else if (e.getEnergy() < tEnergy * 0.5 && dist < currentTargetDist * 1.3) switchTarget = true;
+        // pick the target, stick with it unless theres none, someone is way closer,
+        // or someone is way weaker and not far off
+        boolean switchTarget = (targetId == -1); // no target means we take this one
+        if (!switchTarget && id != targetId) { // seeing someone else
+            if (dist < currentTargetDist * 0.7) switchTarget = true; // much closer
+            else if (e.getEnergy() < tEnergy * 0.5 && dist < currentTargetDist * 1.3) switchTarget = true; // much weaker and nearby
         }
-        if (switchTarget) {
-            targetId = id;
-            tTurnRate = 0;
-            prevDir = e.getDirection();
-            tx = pTx = e.getX();
-            ty = pTy = e.getY();
-            tDir = e.getDirection();
-            tSpeed = e.getSpeed();
-            tEnergy = prevEnergy = e.getEnergy();
-            lastScanTurn = now - 1;
-            prevScanTurn = now - 1;
-            lastChangeTurn = now;
-            dmgDealt = 0;
-            gainFromHit = 0;
-            vbullets.clear();   // old virtual bullets belonged to the previous target
-            eWaves.clear();
+        if (switchTarget) { // lock onto the new target
+            targetId = id; // remember who
+            tTurnRate = 0; // no turn data yet
+            prevDir = e.getDirection(); // starting heading
+            tx = pTx = e.getX(); // set current and previous x
+            ty = pTy = e.getY(); // set current and previous y
+            tDir = e.getDirection(); // heading
+            tSpeed = e.getSpeed(); // speed
+            tEnergy = prevEnergy = e.getEnergy(); // set current and previous energy
+            lastScanTurn = now - 1; // pretend we saw them last tick
+            prevScanTurn = now - 1; // same here
+            lastChangeTurn = now; // fresh start for the change timer
+            dmgDealt = 0; // clear bookkeeping
+            gainFromHit = 0; // clear bookkeeping
+            vbullets.clear();   // old virtual bullets were for the last target
+            eWaves.clear(); // old waves too
         }
-        if (id != targetId) return;
+        if (id != targetId) return; // only the target matters from here
 
-        // ---- Track enemy state ----
-        int dt = Math.max(1, now - lastScanTurn);
-        tTurnRate = norm(e.getDirection() - prevDir) / dt;
-        prevDir = e.getDirection();
-        double prevSpeed = tSpeed;
+        // track enemy state
+        int dt = Math.max(1, now - lastScanTurn); // ticks since last scan
+        tTurnRate = norm(e.getDirection() - prevDir) / dt; // degrees turned per tick
+        prevDir = e.getDirection(); // save heading
+        double prevSpeed = tSpeed; // save speed for acceleration
 
-        tx = e.getX();
-        ty = e.getY();
-        tDir = e.getDirection();
-        tSpeed = e.getSpeed();
-        tEnergy = e.getEnergy();
-        lastScanTurn = now;
-        scanTurn = now;
+        tx = e.getX(); // update x
+        ty = e.getY(); // update y
+        tDir = e.getDirection(); // update heading
+        tSpeed = e.getSpeed(); // update speed
+        tEnergy = e.getEnergy(); // update energy
+        lastScanTurn = now; // mark scan time
+        scanTurn = now; // mark newest scan
 
-        // ---- Radar lock (1v1 always; in melee except while doing a full sweep) ----
-        if (getEnemyCount() == 1 || now >= sweepUntil) {
-            double neededTurn = radarBearingTo(tx, ty);
-            double angularWidth = Math.toDegrees(2 * Math.atan(BOT_HALF / Math.max(dist, 1)));
-            double overshoot = Math.copySign(angularWidth * 0.75 + 2, neededTurn);
-            setTurnRadarLeft(neededTurn + overshoot);
+        // radar lock, always in 1v1, in melee except during a full sweep
+        if (getEnemyCount() == 1 || now >= sweepUntil) { // lock allowed
+            double neededTurn = radarBearingTo(tx, ty); // how far to turn the radar
+            double angularWidth = Math.toDegrees(2 * Math.atan(BOT_HALF / Math.max(dist, 1))); // how wide the bot looks
+            double overshoot = Math.copySign(angularWidth * 0.75 + 2, neededTurn); // swing past so the beam keeps catching them
+            setTurnRadarLeft(neededTurn + overshoot); // aim the radar
         }
 
-        // ---- Learn from virtual bullets that have now reached the enemy ----
+        // learn from virtual bullets that reached the enemy
         resolveVirtualBullets();
 
-        // ---- Fire power ----
-        double power;
-        if (dist < 150) power = 3;
-        else if (dist < 350) power = 2.5;
-        else if (dist < 600) power = 1.8;
-        else power = 1.2;
-        if (getEnemyCount() > 1 && dist > 500) power = Math.min(power, 1.5);
-        if (getEnergy() < 20) power = Math.min(power, 1.5);
-        if (getEnergy() < 8) power = Math.min(power, 0.8);
-        // never use more power than a kill shot needs (damage = 4p, or 6p - 2 above power 1)
-        double killPower = tEnergy <= 4 ? tEnergy / 4 : (tEnergy + 2) / 6;
-        power = Math.min(power, Math.max(0.1, killPower + 0.05));
-        power = Math.max(0.1, Math.min(3, power));
+        // fire power
+        double power; // bullet power
+        if (dist < 150) power = 3; // close, hit hard
+        else if (dist < 350) power = 2.5; // medium
+        else if (dist < 600) power = 1.8; // far
+        else power = 1.2; // very far, save energy
+        if (getEnemyCount() > 1 && dist > 500) power = Math.min(power, 1.5); // melee and far, go easy
+        if (getEnergy() < 20) power = Math.min(power, 1.5); // low energy, be careful
+        if (getEnergy() < 8) power = Math.min(power, 0.8); // really low, be very careful
+        // dont use more power than a kill shot needs (damage is 4p, or 6p - 2 above power 1)
+        double killPower = tEnergy <= 4 ? tEnergy / 4 : (tEnergy + 2) / 6; // power that exactly kills
+        power = Math.min(power, Math.max(0.1, killPower + 0.05)); // cap at the kill shot plus a hair
+        power = Math.max(0.1, Math.min(3, power)); // keep it in the legal range
 
-        double bulletSpeed = calcBulletSpeed(power);
+        double bulletSpeed = calcBulletSpeed(power); // speed for that power
 
-        // ---- Situation (for the guess-factor gun) ----
-        double abs = angleTo(getX(), getY(), tx, ty);
-        double lv = tSpeed * Math.sin(Math.toRadians(tDir - abs));   // enemy's sideways speed
-        if (Math.abs(lv) > 0.5) {
-            int s = lv > 0 ? 1 : -1;
-            if (s != lastLatDir) lastChangeTurn = now;
-            lastLatDir = s;
+        // situation for the guess factor gun
+        double abs = angleTo(getX(), getY(), tx, ty); // direct angle to the enemy
+        double lv = tSpeed * Math.sin(Math.toRadians(tDir - abs));   // enemys sideways speed
+        if (Math.abs(lv) > 0.5) { // moving sideways enough to count
+            int s = lv > 0 ? 1 : -1; // which way
+            if (s != lastLatDir) lastChangeTurn = now; // direction changed
+            lastLatDir = s; // remember it
         }
-        if (Math.abs(tSpeed - prevSpeed) > 1.5) lastChangeTurn = now;
-        int latDir = lastLatDir;
-        int[] seg = segments(dist, bulletSpeed, lv, prevSpeed, now);
+        if (Math.abs(tSpeed - prevSpeed) > 1.5) lastChangeTurn = now; // big speed change
+        int latDir = lastLatDir; // sideways direction to use
+        int[] seg = segments(dist, bulletSpeed, lv, prevSpeed, now); // current situation buckets
         double mea = Math.toDegrees(Math.asin(8.0 / bulletSpeed));   // max escape angle
 
-        // ---- Aim angle for each gun (absolute degrees) ----
-        double[] aim = new double[GUNS];
-        aim[0] = abs;                                                        // head-on
-        double[] lin = predict(0, bulletSpeed);
+        // aim angle for each gun in absolute degrees
+        double[] aim = new double[GUNS]; // one aim angle per gun
+        aim[0] = abs;                                                        // head on
+        double[] lin = predict(0, bulletSpeed); // predicted spot if they go straight
         aim[1] = angleTo(getX(), getY(), lin[0], lin[1]);                    // linear
-        double[] cir = predict(tTurnRate, bulletSpeed);
+        double[] cir = predict(tTurnRate, bulletSpeed); // predicted spot if they keep turning
         aim[2] = angleTo(getX(), getY(), cir[0], cir[1]);                    // circular
 
-        double[] comb = combinedStats(seg);
-        int bestBin = CENTER;
-        for (int b = 0; b < BINS; b++) {
-            if (comb[b] > comb[bestBin] + 1e-9) bestBin = b;
+        double[] comb = combinedStats(seg); // combined votes from every buffer
+        int bestBin = CENTER; // start at the middle
+        for (int b = 0; b < BINS; b++) { // look for the tallest bin
+            if (comb[b] > comb[bestBin] + 1e-9) bestBin = b; // new peak
         }
-        double gfAim = (bestBin - CENTER) / (double) CENTER;
-        aim[3] = abs + latDir * gfAim * mea;                                 // guess-factor
+        double gfAim = (bestBin - CENTER) / (double) CENTER; // convert bin to guess factor
+        aim[3] = abs + latDir * gfAim * mea;                                 // guess factor
         for (int g = 0; g < GUNS; g++) aim[g] = clampAim(aim[g], dist);      // never aim outside the arena
 
-        // Record a virtual bullet for every gun (scored later)
-        VBullet vb = new VBullet();
-        vb.ox = getX();
-        vb.oy = getY();
-        vb.speed = bulletSpeed;
-        vb.fireTurn = now + 1;
-        vb.abs = abs;
-        vb.latDir = latDir;
-        vb.mea = mea;
-        System.arraycopy(seg, 0, vb.seg, 0, 4);
-        System.arraycopy(aim, 0, vb.angles, 0, GUNS);
-        vbullets.add(vb);
-        if (vbullets.size() > 200) vbullets.remove(0);
+        // record a virtual bullet for every gun, scored later
+        VBullet vb = new VBullet(); // new virtual bullet
+        vb.ox = getX(); // our x at fire time
+        vb.oy = getY(); // our y at fire time
+        vb.speed = bulletSpeed; // its speed
+        vb.fireTurn = now + 1; // it leaves next tick
+        vb.abs = abs; // direct angle then
+        vb.latDir = latDir; // enemy sideways direction then
+        vb.mea = mea; // max escape angle
+        System.arraycopy(seg, 0, vb.seg, 0, 4); // copy segment indexes
+        System.arraycopy(aim, 0, vb.angles, 0, GUNS); // copy every guns aim
+        vbullets.add(vb); // queue it for scoring
+        if (vbullets.size() > 200) vbullets.remove(0); // dont let the list grow forever
 
-        // ---- Use whichever gun has been hitting best (ties go to circular) ----
-        int best = 2;
-        for (int g = 0; g < GUNS; g++) {
-            if (gunScore[g] > gunScore[best]) best = g;
+        // use whichever gun has been hitting best, ties go to circular
+        int best = 2; // default to circular
+        for (int g = 0; g < GUNS; g++) { // compare all guns
+            if (gunScore[g] > gunScore[best]) best = g; // better scorer
         }
 
-        // ---- Aim and fire ----
-        double gunTurn = norm(aim[best] - getGunDirection());
-        setTurnGunLeft(gunTurn);
-        double tolerance = Math.toDegrees(Math.atan(BOT_HALF / Math.max(dist, 1)));
-        if (Math.abs(gunTurn) <= tolerance && getGunHeat() == 0 && getEnergy() > power) {
-            setFire(power);
+        // aim and fire
+        double gunTurn = norm(aim[best] - getGunDirection()); // how far to turn the gun
+        setTurnGunLeft(gunTurn); // queue the gun turn
+        double tolerance = Math.toDegrees(Math.atan(BOT_HALF / Math.max(dist, 1))); // angle that still hits the bot
+        if (Math.abs(gunTurn) <= tolerance && getGunHeat() == 0 && getEnergy() > power) { // aimed, cool and have energy
+            setFire(power); // shoot
         }
     }
 
-    /** Which segment of each guess-factor buffer describes the current situation. */
+    // which segment of each guess factor buffer matches the current situation
     private int[] segments(double dist, double bulletSpeed, double lv, double prevSpeed, int now) {
-        double alv = Math.abs(lv);
-        double flight = dist / bulletSpeed;
-        int ft = flight < 10 ? 0 : (flight < 20 ? 1 : (flight < 30 ? 2 : 3));
-        int lvb = alv < 1 ? 0 : (alv < 3 ? 1 : (alv < 5.5 ? 2 : 3));
+        double alv = Math.abs(lv); // absolute sideways speed
+        double flight = dist / bulletSpeed; // bullet flight time
+        int ft = flight < 10 ? 0 : (flight < 20 ? 1 : (flight < 30 ? 2 : 3)); // flight time bucket
+        int lvb = alv < 1 ? 0 : (alv < 3 ? 1 : (alv < 5.5 ? 2 : 3)); // sideways speed bucket
 
-        double abs = angleTo(getX(), getY(), tx, ty);
-        double adv = -tSpeed * Math.cos(Math.toRadians(tDir - abs));   // + means coming toward us
-        int advb = adv < -2 ? 0 : (adv < 2 ? 1 : 2);
+        double abs = angleTo(getX(), getY(), tx, ty); // direct angle to the enemy
+        double adv = -tSpeed * Math.cos(Math.toRadians(tDir - abs));   // positive means coming at us
+        int advb = adv < -2 ? 0 : (adv < 2 ? 1 : 2); // advancing speed bucket
 
-        double moveAngle = tSpeed >= 0 ? tDir : tDir + 180;
-        double room = rayToWall(tx, ty, moveAngle) / (8 * flight + 1);
-        int wallb = room < 0.6 ? 0 : (room < 1.2 ? 1 : 2);
+        double moveAngle = tSpeed >= 0 ? tDir : tDir + 180; // direction theyre actually moving
+        double room = rayToWall(tx, ty, moveAngle) / (8 * flight + 1); // wall room compared to how far they can go
+        int wallb = room < 0.6 ? 0 : (room < 1.2 ? 1 : 2); // wall room bucket
 
-        double accel = Math.abs(tSpeed) - Math.abs(prevSpeed);
-        int accb = accel < -0.5 ? 0 : (accel > 0.5 ? 2 : 1);
+        double accel = Math.abs(tSpeed) - Math.abs(prevSpeed); // speeding up or slowing down
+        int accb = accel < -0.5 ? 0 : (accel > 0.5 ? 2 : 1); // acceleration bucket
 
-        int since = now - lastChangeTurn;
-        int sinceb = since < 12 ? 0 : (since < 35 ? 1 : 2);
+        int since = now - lastChangeTurn; // ticks since the last change
+        int sinceb = since < 12 ? 0 : (since < 35 ? 1 : 2); // time since change bucket
 
-        return new int[]{
-                ft * 4 + lvb,
-                (lvb * 3 + wallb) * 3 + accb,
-                (ft * 3 + advb) * 3 + sinceb,
-                0
+        return new int[]{ // one index per buffer
+                ft * 4 + lvb, // buffer 0
+                (lvb * 3 + wallb) * 3 + accb, // buffer 1
+                (ft * 3 + advb) * 3 + sinceb, // buffer 2
+                0 // buffer 3 has just one segment
         };
     }
 
-    /** Every buffer votes; a segment with little data has little say. */
+    // every buffer votes, a segment with little data has little say
     private double[] combinedStats(int[] seg) {
-        double[] out = new double[BINS];
-        for (int k = 0; k < gf.length; k++) {
-            double[] st = gf[k][seg[k]];
-            double total = 1;
-            for (int b = 0; b < BINS; b++) total += st[b];
-            for (int b = 0; b < BINS; b++) out[b] += GF_WEIGHT[k] * st[b] / total;
+        double[] out = new double[BINS]; // combined result
+        for (int k = 0; k < gf.length; k++) { // each buffer
+            double[] st = gf[k][seg[k]]; // the segment that matches now
+            double total = 1; // starts at 1 so empty segments stay quiet
+            for (int b = 0; b < BINS; b++) total += st[b]; // sum the bins
+            for (int b = 0; b < BINS; b++) out[b] += GF_WEIGHT[k] * st[b] / total; // add a normalized weighted vote
         }
-        return out;
+        return out; // final votes
     }
 
-    /** Distance from (x, y) to the arena edge (inset by half a bot) along the given direction. */
+    // distance from x y to the arena edge (inset by half a bot) along the given direction
     private double rayToWall(double x, double y, double angle) {
-        double dx = Math.cos(Math.toRadians(angle)), dy = Math.sin(Math.toRadians(angle));
-        double t = 1e9;
-        if (dx > 1e-9) t = Math.min(t, (getArenaWidth() - BOT_HALF - x) / dx);
-        else if (dx < -1e-9) t = Math.min(t, (BOT_HALF - x) / dx);
-        if (dy > 1e-9) t = Math.min(t, (getArenaHeight() - BOT_HALF - y) / dy);
-        else if (dy < -1e-9) t = Math.min(t, (BOT_HALF - y) / dy);
-        return Math.max(0, t);
+        double dx = Math.cos(Math.toRadians(angle)), dy = Math.sin(Math.toRadians(angle)); // direction vector
+        double t = 1e9; // closest hit so far
+        if (dx > 1e-9) t = Math.min(t, (getArenaWidth() - BOT_HALF - x) / dx); // heading right, hit the right wall
+        else if (dx < -1e-9) t = Math.min(t, (BOT_HALF - x) / dx); // heading left, hit the left wall
+        if (dy > 1e-9) t = Math.min(t, (getArenaHeight() - BOT_HALF - y) / dy); // heading up, hit the top wall
+        else if (dy < -1e-9) t = Math.min(t, (BOT_HALF - y) / dy); // heading down, hit the bottom wall
+        return Math.max(0, t); // never negative
     }
 
-    /** If an aim angle points outside the arena, pull the aim point back inside it. */
+    // if an aim angle points outside the arena pull the aim point back in
     private double clampAim(double angle, double dist) {
-        double px = clamp(getX() + Math.cos(Math.toRadians(angle)) * dist, BOT_HALF, getArenaWidth() - BOT_HALF);
-        double py = clamp(getY() + Math.sin(Math.toRadians(angle)) * dist, BOT_HALF, getArenaHeight() - BOT_HALF);
-        return angleTo(getX(), getY(), px, py);
+        double px = clamp(getX() + Math.cos(Math.toRadians(angle)) * dist, BOT_HALF, getArenaWidth() - BOT_HALF); // aim point x kept inside
+        double py = clamp(getY() + Math.sin(Math.toRadians(angle)) * dist, BOT_HALF, getArenaHeight() - BOT_HALF); // aim point y kept inside
+        return angleTo(getX(), getY(), px, py); // angle to the clamped point
     }
 
-    /** Predict where the enemy will be when a bullet of the given speed arrives. */
+    // predict where the enemy will be when a bullet of this speed gets there
     private double[] predict(double turnRate, double bulletSpeed) {
-        double px = tx, py = ty, heading = tDir;
-        for (int t = 1; t <= 100; t++) {
-            heading += turnRate;
-            double r = Math.toRadians(heading);
-            px += Math.cos(r) * tSpeed;
-            py += Math.sin(r) * tSpeed;
-            px = clamp(px, BOT_HALF, getArenaWidth() - BOT_HALF);
-            py = clamp(py, BOT_HALF, getArenaHeight() - BOT_HALF);
-            if (distanceTo(px, py) <= bulletSpeed * t) break;
+        double px = tx, py = ty, heading = tDir; // start at the enemys current state
+        for (int t = 1; t <= 100; t++) { // step forward in time
+            heading += turnRate; // apply the turn
+            double r = Math.toRadians(heading); // heading in radians
+            px += Math.cos(r) * tSpeed; // move x
+            py += Math.sin(r) * tSpeed; // move y
+            px = clamp(px, BOT_HALF, getArenaWidth() - BOT_HALF); // stay in the arena x
+            py = clamp(py, BOT_HALF, getArenaHeight() - BOT_HALF); // stay in the arena y
+            if (distanceTo(px, py) <= bulletSpeed * t) break; // bullet would have arrived by now
         }
-        return new double[]{px, py};
+        return new double[]{px, py}; // predicted position
     }
 
-    /**
-     * A virtual bullet "arrives" once it has traveled as far as the enemy is from its origin.
-     * Then we (1) score each gun by whether it would have hit and
-     *             (2) record where the enemy really was, in guess-factor terms.
-     */
+    // a virtual bullet arrives once its traveled as far as the enemy is from its origin
+    // then we score each gun on whether it couldve hit
+    // and record where the enemy really was in guess factor terms
     private void resolveVirtualBullets() {
-        Iterator<VBullet> it = vbullets.iterator();
-        while (it.hasNext()) {
-            VBullet vb = it.next();
-            int age = getTurnNumber() - vb.fireTurn;
-            if (age > 120) {
-                it.remove();
-                continue;
+        Iterator<VBullet> it = vbullets.iterator(); // iterator so we can remove while looping
+        while (it.hasNext()) { // every virtual bullet
+            VBullet vb = it.next(); // this one
+            int age = getTurnNumber() - vb.fireTurn; // ticks since it was fired
+            if (age > 120) { // too old to matter
+                it.remove(); // toss it
+                continue; // next one
             }
-            double d = Math.hypot(tx - vb.ox, ty - vb.oy);
-            if (vb.speed * age >= d) {
-                double actual = angleTo(vb.ox, vb.oy, tx, ty);
-                double tol = Math.toDegrees(Math.atan(BOT_HALF / Math.max(d, 1)));
+            double d = Math.hypot(tx - vb.ox, ty - vb.oy); // distance from origin to the enemy now
+            if (vb.speed * age >= d) { // bullet has reached the enemy
+                double actual = angleTo(vb.ox, vb.oy, tx, ty); // where the enemy really is
+                double tol = Math.toDegrees(Math.atan(BOT_HALF / Math.max(d, 1))); // hit tolerance at this range
 
                 // score the guns
-                for (int g = 0; g < GUNS; g++) {
-                    boolean hit = Math.abs(norm(actual - vb.angles[g])) <= tol;
-                    gunScore[g] = gunScore[g] * 0.97 + (hit ? 1 : 0);
+                for (int g = 0; g < GUNS; g++) { // each gun
+                    boolean hit = Math.abs(norm(actual - vb.angles[g])) <= tol; // would it have hit
+                    gunScore[g] = gunScore[g] * 0.97 + (hit ? 1 : 0); // decayed running score
                 }
 
-                // update every guess-factor buffer (smoothed around the observed bin)
-                double offset = norm(actual - vb.abs);
-                double g = clamp(offset * vb.latDir / vb.mea, -1, 1);
-                int idx = (int) Math.round(g * CENTER + CENTER);
-                for (int k = 0; k < gf.length; k++) {
-                    double[] st = gf[k][vb.seg[k]];
-                    for (int b = 0; b < BINS; b++) {
-                        double z = (b - idx) / 1.5;
-                        st[b] = st[b] * GF_DECAY[k] + Math.exp(-0.5 * z * z);
+                // update every guess factor buffer, smoothed around the observed bin
+                double offset = norm(actual - vb.abs); // offset from the direct angle
+                double g = clamp(offset * vb.latDir / vb.mea, -1, 1); // guess factor that happened
+                int idx = (int) Math.round(g * CENTER + CENTER); // its bin
+                for (int k = 0; k < gf.length; k++) { // each buffer
+                    double[] st = gf[k][vb.seg[k]]; // the segment that applied at fire time
+                    for (int b = 0; b < BINS; b++) { // each bin
+                        double z = (b - idx) / 1.5; // distance from the observed bin
+                        st[b] = st[b] * GF_DECAY[k] + Math.exp(-0.5 * z * z); // forget a bit then add a gaussian bump
                     }
                 }
 
-                it.remove();
+                it.remove(); // finished with this bullet
             }
         }
     }
 
-    // =====================================================================
-    //  OTHER EVENTS
-    // =====================================================================
-
     @Override
-    public void onBotDeath(BotDeathEvent e) {
-        bots.remove(e.getVictimId());
-        if (e.getVictimId() == targetId) {
-            targetId = -1;
-            vbullets.clear();
-            eWaves.clear();
+    public void onBotDeath(BotDeathEvent e) { // someone died
+        bots.remove(e.getVictimId()); // forget them
+        if (e.getVictimId() == targetId) { // it was our target
+            targetId = -1; // need a new one
+            vbullets.clear(); // their virtual bullets are useless now
+            eWaves.clear(); // and their waves
         }
     }
 
     @Override
-    public void onBulletHit(BulletHitBotEvent e) {
-        if (e.getVictimId() == targetId) dmgDealt += e.getDamage();
+    public void onBulletHit(BulletHitBotEvent e) { // our bullet hit someone
+        if (e.getVictimId() == targetId) dmgDealt += e.getDamage(); // count it so we dont mistake it for a shot
     }
 
     @Override
-    public void onBulletHitBullet(BulletHitBulletEvent e) {
-        // one of our bullets cancelled an enemy bullet: forget that wave
-        EWave w = matchWave(e.getHitBullet());
-        if (w != null) eWaves.remove(w);
+    public void onBulletHitBullet(BulletHitBulletEvent e) { // two bullets collided
+        // one of our bullets cancelled an enemy bullet so forget that wave
+        EWave w = matchWave(e.getHitBullet()); // find the matching wave
+        if (w != null) eWaves.remove(w); // drop it
     }
 
     @Override
-    public void onHitBot(HitBotEvent e) {
-        lastCollisionTurn = getTurnNumber();
-        flipDirection(true);   // collision: back off instead of trading ram damage
+    public void onHitBot(HitBotEvent e) { // we rammed a bot
+        lastCollisionTurn = getTurnNumber(); // note it so the energy drop isnt read as a shot
+        flipDirection(true);   // collision so back off instead of trading ram damage
     }
 
     @Override
-    public void onHitWall(HitWallEvent e) {
-        flipDirection(true);
+    public void onHitWall(HitWallEvent e) { // we hit a wall
+        flipDirection(true); // turn around
     }
 
     @Override
-    public void onHitByBullet(HitByBulletEvent e) {
-        BulletState b = e.getBullet();
-        gainFromHit += 3 * b.getPower();      // the shooter gets energy back when it hits
-        if (getEnemyCount() == 1) {
-            EWave w = matchWave(b);
-            if (w != null) {
-                recordSurf(w, getX(), getY(), 1.0);
-                eWaves.remove(w);
+    public void onHitByBullet(HitByBulletEvent e) { // we got shot
+        BulletState b = e.getBullet(); // the bullet
+        gainFromHit += 3 * b.getPower();      // shooter gets energy back when it hits
+        if (getEnemyCount() == 1) { // 1v1
+            EWave w = matchWave(b); // which wave was it
+            if (w != null) { // found it
+                recordSurf(w, getX(), getY(), 1.0); // full weight, this spot was dangerous
+                eWaves.remove(w); // done with the wave
             }
-        } else {
-            flipDirection(false);
+        } else { // melee
+            flipDirection(false); // just change direction
         }
     }
 
-    /** Which enemy wave does this bullet belong to? (same speed, and it is where the wave's edge is) */
+    // which enemy wave does this bullet belong to, same speed and sitting where the waves edge is
     private EWave matchWave(BulletState b) {
-        int now = getTurnNumber();
-        EWave best = null;
-        double bestErr = 60;
-        for (EWave w : eWaves) {
-            if (Math.abs(w.speed - b.getSpeed()) > 0.3) continue;
-            double err = Math.abs(Math.hypot(b.getX() - w.ox, b.getY() - w.oy) - waveRadius(w, now));
-            if (err < bestErr) {
-                bestErr = err;
-                best = w;
+        int now = getTurnNumber(); // current turn
+        EWave best = null; // best match so far
+        double bestErr = 60; // max error we accept
+        for (EWave w : eWaves) { // every wave
+            if (Math.abs(w.speed - b.getSpeed()) > 0.3) continue; // speed doesnt match
+            double err = Math.abs(Math.hypot(b.getX() - w.ox, b.getY() - w.oy) - waveRadius(w, now)); // how far the bullet is from the wave edge
+            if (err < bestErr) { // closer than before
+                bestErr = err; // new best error
+                best = w; // new best wave
             }
         }
-        return best;
+        return best; // null if nothing matched
     }
 
     @Override
-    public void onConnectionError(ConnectionErrorEvent e) {
-        System.out.println("Could not connect to Robocode Tank Royale.");
-        System.out.println("Open the Tank Royale app and press Ctrl+B (Battle -> Start Battle) FIRST,");
-        System.out.println("then click Run again.");
-        System.exit(1);
+    public void onConnectionError(ConnectionErrorEvent e) { // couldnt reach the server
+        System.out.println("Could not connect to Robocode Tank Royale."); // tell the user
+        System.out.println("Open the Tank Royale app and press Ctrl+B (Battle -> Start Battle) FIRST,"); // how to fix it
+        System.out.println("then click Run again."); // last instruction
+        System.exit(1); // quit
     }
 
-    // =====================================================================
-    //  HELPERS
-    // =====================================================================
-
-    /** Absolute angle (degrees, 0 = east) from (x1, y1) to (x2, y2). */
+    // absolute angle (degrees, 0 is east) from x1 y1 to x2 y2
     private static double angleTo(double x1, double y1, double x2, double y2) {
-        return Math.toDegrees(Math.atan2(y2 - y1, x2 - x1));
+        return Math.toDegrees(Math.atan2(y2 - y1, x2 - x1)); // atan2 gives the angle, convert to degrees
     }
 
-    /** Normalizes an angle to the range -180..180. */
+    // normalizes an angle to -180..180
     private static double norm(double angle) {
-        while (angle > 180) angle -= 360;
-        while (angle <= -180) angle += 360;
-        return angle;
+        while (angle > 180) angle -= 360; // too big, wrap down
+        while (angle <= -180) angle += 360; // too small, wrap up
+        return angle; // now in range
     }
 
-    private static double clamp(double v, double lo, double hi) {
-        return Math.max(lo, Math.min(hi, v));
+    private static double clamp(double v, double lo, double hi) { // keep a value between lo and hi
+        return Math.max(lo, Math.min(hi, v)); // cap both ends
     }
 }
