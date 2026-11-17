@@ -100,7 +100,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     OPBot() { // constructor
         super(BotInfo.builder() // hand bot info to the base class
                 .setName("OPBot") // bot name
-                .setVersion("1.0") // bot version
+                .setVersion("3.1.4.1.5.9.2.6.5.3.5") // bot version
                 .addAuthor("me") // bot author
                 .build()); // finish building the info
     }
