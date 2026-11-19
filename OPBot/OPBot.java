@@ -1,4 +1,4 @@
-mport dev.robocode.tankroyale.botapi.Bot;
+import dev.robocode.tankroyale.botapi.Bot;
 import dev.robocode.tankroyale.botapi.BotInfo;
 import dev.robocode.tankroyale.botapi.BulletState;
 import dev.robocode.tankroyale.botapi.events.BotDeathEvent;
