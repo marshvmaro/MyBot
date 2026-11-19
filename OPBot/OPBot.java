@@ -114,7 +114,7 @@ public class OPBot extends Bot {
     OPBot() {
         super(BotInfo.builder()
                 .setName("OPBot")
-                .setVersion("3.1.4.1.5.9.2.6.5.3.5")
+                .setVersion("3.141")
                 .addAuthor("me")
                 .build());
     }
