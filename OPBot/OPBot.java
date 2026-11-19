@@ -1,4 +1,4 @@
-import dev.robocode.tankroyale.botapi.Bot;
+mport dev.robocode.tankroyale.botapi.Bot;
 import dev.robocode.tankroyale.botapi.BotInfo;
 import dev.robocode.tankroyale.botapi.BulletState;
 import dev.robocode.tankroyale.botapi.events.BotDeathEvent;
@@ -19,77 +19,121 @@ import java.util.Map;
 
 public class OPBot extends Bot { // our bot, extends the tank royale base class
 
-    private static final double BOT_HALF = 18.0;     // bots are 36x36
-    private static final int GUNS = 4;               // how many virtual guns we run
-    private static final int BINS = 31;              // guess factor bins
-    private static final int CENTER = BINS / 2;      // middle bin, guess factor zero
+    // Referenced in: clampAim(), onScannedBot(), predict(), predictDanger(), rayToWall(), resolveVirtualBullets(), updateWaves().
+    private static final double BOT_HALF = 18.0;     // half the bot's 36-pixel width, used for wall and hit checks
+    // Referenced in: onScannedBot(), resolveVirtualBullets().
+    private static final int GUNS = 4;               // number of aiming methods being tested against each other
+    // Referenced in: combinedStats(), onScannedBot(), recordSurf(), resolveVirtualBullets().
+    private static final int BINS = 31;              // number of slots used to track where enemy movement tends to go
+    // Referenced in: onScannedBot(), predictDanger(), recordSurf(), resolveVirtualBullets().
+    private static final int CENTER = BINS / 2;      // center slot, representing a shot aimed directly at the enemy
 
     // tuning knobs
+    // Referenced in: updateWaves().
     private static final double PASS_WEIGHT = 0.15;  // how much a wave that missed us counts in surf stats
+    // Referenced in: spawnWave().
     private static final int WAVE_OFFSET = -1;       // timing fix, measured against real hits in tank royale 1.4.0
 
     // target tracking
+    // Referenced in: doMovement(), doRadar(), onBotDeath(), onBulletHit(), onScannedBot(), processEnemyShots(), run().
     private int targetId = -1;                       // id of who were shooting at, -1 for nobody
+    // Referenced in: onScannedBot(), predict(), processEnemyShots(), resolveVirtualBullets(), segments(), spawnWave(), surfMove().
     private double tx, ty, tDir, tSpeed, tEnergy;    // target x y heading speed and energy
+    // Referenced in: onScannedBot().
     private double tTurnRate = 0;                    // how fast the target is turning per tick
+    // Referenced in: onScannedBot().
     private double prevDir = 0;                      // target heading at the last scan
+    // Referenced in: doRadar(), onScannedBot(), run().
     private int lastScanTurn = -100;                 // turn we last scanned the target
+    // Referenced in: onScannedBot().
     private int lastLatDir = 1;                      // enemys last nonzero sideways direction
+    // Referenced in: onScannedBot(), segments().
     private int lastChangeTurn = 0;                  // last time enemy changed direction or speed a lot
 
     // enemy shot detection for 1v1 surfing
+    // Referenced in: onScannedBot(), processEnemyShots(), run(), spawnWave().
     private int scanTurn = -100;                     // turn of the newest scan of the target
+    // Referenced in: onScannedBot(), processEnemyShots(), run().
     private int prevScanTurn = -100;                 // turn of the scan before that
+    // Referenced in: onScannedBot(), processEnemyShots().
     private double prevEnergy = 100;                 // target energy at the previous scan
+    // Referenced in: onScannedBot(), processEnemyShots().
     private double pTx, pTy;                         // target position at the previous scan
+    // Referenced in: processEnemyShots(), spawnWave().
     private double pMeX, pMeY;                       // our position at the previous scan
+    // Referenced in: processEnemyShots(), spawnWave().
     private int myLatDirPrev = 1, myLatDir = 1;      // our sideways direction relative to the enemy
+    // Referenced in: onBulletHit(), onScannedBot(), processEnemyShots(), run().
     private double dmgDealt = 0, gainFromHit = 0;    // energy changes explained by bullet hits
+    // Referenced in: onHitBot(), processEnemyShots(), run().
     private int lastCollisionTurn = -100;            // last turn we bumped into a bot
 
     // every bot weve seen, id to x y turnSeen energy
+    // Referenced in: onBotDeath(), onScannedBot(), riskAt(), run().
     private final Map<Integer, double[]> bots = new HashMap<>(); // lookup of last known bot info
 
     // movement
+    // Referenced in: doMovement(), flipDirection(), run(), surfMove().
     private int orbitDir = 1;                        // which way were circling
+    // Referenced in: flipDirection(), run(), surfMove().
     private int flipCooldown = 0;                    // ticks before we can flip direction again
+    // Referenced in: flipDirection(), surfMove().
     private double prefDist = 380;                   // distance we like to keep from the enemy
+    // Referenced in: meleeMove(), pickDestination().
     private double destX, destY;                     // melee destination
+    // Referenced in: meleeMove(), pickDestination(), run().
     private int destTurn = -100;                     // turn we picked the current destination
 
     // radar for melee
+    // Referenced in: doRadar(), onScannedBot(), run().
     private int sweepUntil = -1;                     // keep sweeping until this turn
+    // Referenced in: doRadar(), run().
     private int lastSweepEnd = 0;                    // turn the last sweep ended
 
     // enemy waves and surf stats
     private static class EWave { // one enemy bullet wave
+        // Referenced in: spawnWave(), waveRadius(), timeLeft(), predictDanger(), matchWave(), and updateWaves().
         double ox, oy, speed, directAngle, mea; // origin, speed, angle straight at us, max escape angle
+        // Referenced in: spawnWave(), waveRadius(), predictDanger(), and matchWave().
         int fireTurn, latDir; // when it was fired and our sideways direction then
     }
+    // Referenced in: matchWave(), onBotDeath(), onBulletHitBullet(), onHitByBullet(), onScannedBot(), run(), spawnWave(), upcomingWaves(), updateWaves().
     private final List<EWave> eWaves = new ArrayList<>(); // waves currently in the air
-    private final double[] surf = new double[BINS];       // danger per bin from where weve been hit
+    // Referenced in: predictDanger(), recordSurf().
+    private final double[] surf = new double[BINS];       // stores how dangerous each movement angle has been based on past hits
 
     // virtual guns
+    // Referenced in: onScannedBot(), resolveVirtualBullets().
     private final double[] gunScore = {0.0, 0.0, 0.01, 0.0}; // running hit score per gun, circular gets a tiny head start
+    // Referenced in: onBotDeath(), onScannedBot(), resolveVirtualBullets(), run().
     private final List<VBullet> vbullets = new ArrayList<>(); // virtual bullets waiting to be scored
 
     // guess factor buffers (see segments below) and how fast each one forgets
-    private final double[][][] gf = { // all the stat buffers
+    private final double[][][] gf = { // separate guess factor history buffers for different enemy situations
             new double[16][BINS],   // 0: flight time x sideways speed
             new double[36][BINS],   // 1: sideways speed x wall room x acceleration
             new double[36][BINS],   // 2: flight time x advancing speed x time since change
             new double[1][BINS]     // 3: everything together, forgets fast
     };
-    private static final double[] GF_DECAY = {0.995, 0.99, 0.993, 0.97}; // forgetting rate per buffer
-    private static final double[] GF_WEIGHT = {1.0, 1.0, 1.0, 0.5};      // vote weight per buffer
+    // Referenced in: resolveVirtualBullets().
+    private static final double[] GF_DECAY = {0.995, 0.99, 0.993, 0.97}; // how much old data each buffer keeps each time it learns
+    // Referenced in: combinedStats().
+    private static final double[] GF_WEIGHT = {1.0, 1.0, 1.0, 0.5};      // how strongly each buffer affects the final aim prediction
 
     private static class VBullet { // a pretend bullet for each gun
+        // Referenced in: onScannedBot() when the virtual bullet is created, and resolveVirtualBullets() when it is scored.
         double ox, oy, speed; // where it started and how fast it goes
+        // Referenced in: onScannedBot() and resolveVirtualBullets().
         int fireTurn; // turn it was fired
+        // Referenced in: onScannedBot() when the four aim methods are saved, and resolveVirtualBullets() when they are compared.
         double[] angles = new double[GUNS]; // where each gun aimed
+        // Referenced in: onScannedBot() and resolveVirtualBullets().
         double abs; // direct angle to the enemy at fire time
+        // Referenced in: onScannedBot() and resolveVirtualBullets().
         int latDir; // enemy sideways direction at fire time
+        // Referenced in: onScannedBot() and resolveVirtualBullets().
         double mea; // max escape angle for this bullet speed
+        // Referenced in: onScannedBot() when the bullet is created, and resolveVirtualBullets() when learning is updated.
         int[] seg = new int[4]; // which segment of each buffer applied
     }
 
@@ -106,6 +150,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     @Override
+    // Called by Tank Royale the start of each round.
     public void run() { // called at the start of every round
         setAdjustGunForBodyTurn(true); // gun turns independent of the body
         setAdjustRadarForGunTurn(true); // radar turns independent of the gun
@@ -150,6 +195,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         }
     }
 
+    // Called by: run().
     private void doRadar() { // radar control each tick
         int now = getTurnNumber(); // current turn
         boolean lost = now - lastScanTurn > 2; // target slipped out of the beam
@@ -167,7 +213,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     // runs once a tick after the events, did the target just fire, if so start a wave
-    private void processEnemyShots() {
+    // Called by: run().
+    private void processEnemyShots() { // compare energy between scans to tell whether the enemy fired
         int now = getTurnNumber(); // current turn
         if (targetId == -1 || scanTurn != now) return; // need a fresh scan of the target
 
@@ -196,6 +243,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         if (Math.abs(lat) > 0.1) myLatDir = lat > 0 ? 1 : -1; // only update when were actually moving sideways
     }
 
+    // Called by: processEnemyShots().
     private void spawnWave(double power) { // make a wave from a detected shot
         EWave w = new EWave(); // new wave
         w.ox = tx; // starts at the enemy x
@@ -208,12 +256,14 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         eWaves.add(w); // start tracking it
     }
 
+    // Called by: matchWave(), predictDanger(), timeLeft(), updateWaves().
     private double waveRadius(EWave w, int turn) { // how far the wave front has traveled
         return w.speed * (turn - w.fireTurn); // speed times age
     }
 
     // drop waves that already passed us, learn a little from the ones that missed
-    private void updateWaves() {
+    // Called by: run().
+    private void updateWaves() { // move enemy bullet waves forward and remove the ones that passed
         int now = getTurnNumber(); // current turn
         Iterator<EWave> it = eWaves.iterator(); // iterator so we can remove while looping
         while (it.hasNext()) { // go through every wave
@@ -226,11 +276,13 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         }
     }
 
+    // Called by: predictDanger(), recordSurf().
     private double gfOf(EWave w, double px, double py) { // guess factor of a point relative to a wave
         double offset = norm(angleTo(w.ox, w.oy, px, py) - w.directAngle); // angle offset from direct
         return clamp(offset * w.latDir / w.mea, -1, 1); // scale to -1..1 and fix the direction
     }
 
+    // Called by: onHitByBullet(), updateWaves().
     private void recordSurf(EWave w, double px, double py, double weight) { // add a hit or pass to surf stats
         int idx = (int) Math.round(gfOf(w, px, py) * CENTER + CENTER); // bin where it happened
         for (int b = 0; b < BINS; b++) { // spread over nearby bins
@@ -239,6 +291,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         }
     }
 
+    // Called by: run().
     private void doMovement() { // pick the movement style
         if (targetId == -1) { // nobody to fight yet
             // no target yet so cruise in a wide arc while the radar finds someone
@@ -253,6 +306,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
 
     // 1v1 wave surfing
 
+    // Called by: doMovement().
     private void surfMove() { // 1v1 movement
         double pref = prefDist; // base preferred distance
         if (getEnergy() < tEnergy - 30) pref += 100; // back off when were way behind on energy
@@ -276,20 +330,23 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     // the (up to n) waves still on their way, soonest first
-    private List<EWave> upcomingWaves(int n) {
+    // Called by: surfMove().
+    private List<EWave> upcomingWaves(int n) { // return the closest waves that will reach us next
         int now = getTurnNumber(); // current turn
         List<EWave> out = new ArrayList<>(eWaves); // copy so we can sort
         out.sort((a, b) -> Double.compare(timeLeft(a, now), timeLeft(b, now))); // soonest first
         return out.size() > n ? new ArrayList<>(out.subList(0, n)) : out; // trim to n
     }
 
+    // Called by: upcomingWaves().
     private double timeLeft(EWave w, int now) { // ticks until a wave reaches us
         double d = Math.hypot(getX() - w.ox, getY() - w.oy); // distance to wave origin
         return (d - waveRadius(w, now)) / w.speed; // gap left divided by speed
     }
 
     // direction to drive to circle the enemy in direction dir, nudged toward or away from the preferred distance
-    private double orbitAngle(double x, double y, double ex, double ey, int dir, double pref) {
+    // Called by: predictDanger(), surfMove().
+    private double orbitAngle(double x, double y, double ex, double ey, int dir, double pref) { // calculate the direction needed to circle the enemy
         double theta = angleTo(ex, ey, x, y);      // from the enemy to us
         double d = Math.hypot(x - ex, y - ey); // current distance
         double k = clamp((d - pref) / 5.0, -45, 45);   // too far means lean toward the enemy
@@ -299,7 +356,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     // pretend we keep orbiting in direction dir with the real turn and accel limits
     // and see where we end up when each wave hits
     // danger is how often weve been hit at that spot before
-    private double predictDanger(List<EWave> ws, int dir, double pref) {
+    // Called by: surfMove().
+    private double predictDanger(List<EWave> ws, int dir, double pref) { // simulate a movement direction and total up the danger
         int now = getTurnNumber(); // current turn
         EWave w0 = ws.get(0); // orbit around the first waves origin
         double px = getX(), py = getY(), ph = getDirection(), pv = getSpeed(); // simulated position heading and velocity
@@ -339,6 +397,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
 
     // melee minimum risk
 
+    // Called by: doMovement().
     private void meleeMove() { // melee movement
         double x = getX(), y = getY(); // our position
         int now = getTurnNumber(); // current turn
@@ -349,6 +408,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         driveToward(angleTo(x, y, destX, destY), Math.max(20, Math.min(d, 150))); // head there
     }
 
+    // Called by: meleeMove().
     private void pickDestination() { // sample points and take the safest
         double x = getX(), y = getY(); // our position
         double best = Double.MAX_VALUE; // lowest risk so far
@@ -372,6 +432,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         destTurn = getTurnNumber(); // remember when we picked it
     }
 
+    // Called by: pickDestination().
     private double riskAt(double px, double py, double x, double y) { // how dangerous is a point
         int now = getTurnNumber(); // current turn
         double risk = 0; // running total
@@ -394,7 +455,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     // shared driving helpers
 
     // turn the short way and drive forward or backward toward the travel direction
-    private void driveToward(double travel, double distance) {
+    // Called by: doMovement(), meleeMove(), surfMove().
+    private void driveToward(double travel, double distance) { // turn toward the chosen angle and move that way
         double delta = norm(travel - getDirection()); // how far we need to turn
         int dir = 1; // forward by default
         if (Math.abs(delta) > 90) { // faster to go backward
@@ -407,7 +469,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
 
     // rotate the travel direction toward the enemy side bit by bit until the path ahead stays in the arena
     // dir is the orbit direction so +dir turns toward the enemy
-    private double smooth(double x, double y, double angle, int dir) {
+    // Called by: doMovement(), predictDanger(), surfMove().
+    private double smooth(double x, double y, double angle, int dir) { // adjust a movement angle if its path would run into a wall
         for (int i = 0; i <= 60; i++) { // up to 180 degrees of adjustment
             double a = angle + dir * i * 3; // try turning 3 degrees more each time
             if (insideField(x, y, a)) return a; // first safe angle wins
@@ -415,6 +478,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         return angle; // nothing worked, use the original
     }
 
+    // Called by: smooth().
     private boolean insideField(double fromX, double fromY, double angle) { // would we still be in the arena
         double look = 140; // how far ahead we check
         double margin = 28; // wall buffer
@@ -424,6 +488,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
                 && y > margin && y < getArenaHeight() - margin; // y inside the buffer
     }
 
+    // Called by: onHitBot(), onHitByBullet(), onHitWall(), processEnemyShots(), surfMove().
     private void flipDirection(boolean force) { // reverse the orbit
         if (force || flipCooldown == 0) { // only when forced or cooled down
             orbitDir = -orbitDir; // swap direction
@@ -433,6 +498,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     @Override
+    // Called by Tank Royale Tank Royale detects another bot with the radar.
     public void onScannedBot(ScannedBotEvent e) { // radar saw a bot
         int id = e.getScannedBotId(); // who it is
         int now = getTurnNumber(); // current turn
@@ -491,7 +557,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
         }
 
         // learn from virtual bullets that reached the enemy
-        resolveVirtualBullets();
+        resolveVirtualBullets(); // check which virtual bullets have reached the target and update gun scores
 
         // fire power
         double power; // bullet power
@@ -569,7 +635,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     // which segment of each guess factor buffer matches the current situation
-    private int[] segments(double dist, double bulletSpeed, double lv, double prevSpeed, int now) {
+    // Called by: onScannedBot().
+    private int[] segments(double dist, double bulletSpeed, double lv, double prevSpeed, int now) { // group the current fight into matching guess factor data sections
         double alv = Math.abs(lv); // absolute sideways speed
         double flight = dist / bulletSpeed; // bullet flight time
         int ft = flight < 10 ? 0 : (flight < 20 ? 1 : (flight < 30 ? 2 : 3)); // flight time bucket
@@ -598,7 +665,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     // every buffer votes, a segment with little data has little say
-    private double[] combinedStats(int[] seg) {
+    // Called by: onScannedBot().
+    private double[] combinedStats(int[] seg) { // combine the predictions from all guess factor buffers
         double[] out = new double[BINS]; // combined result
         for (int k = 0; k < gf.length; k++) { // each buffer
             double[] st = gf[k][seg[k]]; // the segment that matches now
@@ -610,7 +678,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     // distance from x y to the arena edge (inset by half a bot) along the given direction
-    private double rayToWall(double x, double y, double angle) {
+    // Called by: segments().
+    private double rayToWall(double x, double y, double angle) { // calculate how far the enemy can travel before reaching a wall
         double dx = Math.cos(Math.toRadians(angle)), dy = Math.sin(Math.toRadians(angle)); // direction vector
         double t = 1e9; // closest hit so far
         if (dx > 1e-9) t = Math.min(t, (getArenaWidth() - BOT_HALF - x) / dx); // heading right, hit the right wall
@@ -621,14 +690,16 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     // if an aim angle points outside the arena pull the aim point back in
-    private double clampAim(double angle, double dist) {
+    // Called by: onScannedBot().
+    private double clampAim(double angle, double dist) { // keep the gun's aim point inside the arena
         double px = clamp(getX() + Math.cos(Math.toRadians(angle)) * dist, BOT_HALF, getArenaWidth() - BOT_HALF); // aim point x kept inside
         double py = clamp(getY() + Math.sin(Math.toRadians(angle)) * dist, BOT_HALF, getArenaHeight() - BOT_HALF); // aim point y kept inside
         return angleTo(getX(), getY(), px, py); // angle to the clamped point
     }
 
     // predict where the enemy will be when a bullet of this speed gets there
-    private double[] predict(double turnRate, double bulletSpeed) {
+    // Called by: onScannedBot().
+    private double[] predict(double turnRate, double bulletSpeed) { // estimate the enemy's future position when our bullet arrives
         double px = tx, py = ty, heading = tDir; // start at the enemys current state
         for (int t = 1; t <= 100; t++) { // step forward in time
             heading += turnRate; // apply the turn
@@ -645,7 +716,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     // a virtual bullet arrives once its traveled as far as the enemy is from its origin
     // then we score each gun on whether it couldve hit
     // and record where the enemy really was in guess factor terms
-    private void resolveVirtualBullets() {
+    // Called by: onScannedBot().
+    private void resolveVirtualBullets() { // score the aiming methods after their pretend bullets reach the target
         Iterator<VBullet> it = vbullets.iterator(); // iterator so we can remove while looping
         while (it.hasNext()) { // every virtual bullet
             VBullet vb = it.next(); // this one
@@ -683,6 +755,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     @Override
+    // Called by Tank Royale Tank Royale reports a bot death.
     public void onBotDeath(BotDeathEvent e) { // someone died
         bots.remove(e.getVictimId()); // forget them
         if (e.getVictimId() == targetId) { // it was our target
@@ -693,11 +766,13 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     @Override
+    // Called by Tank Royale one of our bullets hits a bot.
     public void onBulletHit(BulletHitBotEvent e) { // our bullet hit someone
         if (e.getVictimId() == targetId) dmgDealt += e.getDamage(); // count it so we dont mistake it for a shot
     }
 
     @Override
+    // Called by Tank Royale two bullets collide.
     public void onBulletHitBullet(BulletHitBulletEvent e) { // two bullets collided
         // one of our bullets cancelled an enemy bullet so forget that wave
         EWave w = matchWave(e.getHitBullet()); // find the matching wave
@@ -705,17 +780,20 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     @Override
+    // Called by Tank Royale our bot collides with another bot.
     public void onHitBot(HitBotEvent e) { // we rammed a bot
         lastCollisionTurn = getTurnNumber(); // note it so the energy drop isnt read as a shot
         flipDirection(true);   // collision so back off instead of trading ram damage
     }
 
     @Override
+    // Called by Tank Royale our bot hits a wall.
     public void onHitWall(HitWallEvent e) { // we hit a wall
         flipDirection(true); // turn around
     }
 
     @Override
+    // Called by Tank Royale an enemy bullet hits our bot.
     public void onHitByBullet(HitByBulletEvent e) { // we got shot
         BulletState b = e.getBullet(); // the bullet
         gainFromHit += 3 * b.getPower();      // shooter gets energy back when it hits
@@ -731,7 +809,8 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     // which enemy wave does this bullet belong to, same speed and sitting where the waves edge is
-    private EWave matchWave(BulletState b) {
+    // Called by: onBulletHitBullet(), onHitByBullet().
+    private EWave matchWave(BulletState b) { // find which tracked enemy wave matches the bullet that hit us
         int now = getTurnNumber(); // current turn
         EWave best = null; // best match so far
         double bestErr = 60; // max error we accept
@@ -747,6 +826,7 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     @Override
+    // Called by Tank Royale the connection to the server fails.
     public void onConnectionError(ConnectionErrorEvent e) { // couldnt reach the server
         System.out.println("Could not connect to Robocode Tank Royale."); // tell the user
         System.out.println("Open the Tank Royale app and press Ctrl+B (Battle -> Start Battle) FIRST,"); // how to fix it
@@ -755,17 +835,20 @@ public class OPBot extends Bot { // our bot, extends the tank royale base class
     }
 
     // absolute angle (degrees, 0 is east) from x1 y1 to x2 y2
-    private static double angleTo(double x1, double y1, double x2, double y2) {
+    // Called by: clampAim(), gfOf(), meleeMove(), onScannedBot(), orbitAngle(), processEnemyShots(), resolveVirtualBullets(), riskAt(), segments(), spawnWave().
+    private static double angleTo(double x1, double y1, double x2, double y2) { // find the angle from one position to another
         return Math.toDegrees(Math.atan2(y2 - y1, x2 - x1)); // atan2 gives the angle, convert to degrees
     }
 
     // normalizes an angle to -180..180
-    private static double norm(double angle) {
+    // Called by: driveToward(), gfOf(), onScannedBot(), predictDanger(), resolveVirtualBullets().
+    private static double norm(double angle) { // keep an angle between -180 and 180 degrees
         while (angle > 180) angle -= 360; // too big, wrap down
         while (angle <= -180) angle += 360; // too small, wrap up
         return angle; // now in range
     }
 
+    // Called by: clampAim(), gfOf(), orbitAngle(), predict(), predictDanger(), resolveVirtualBullets().
     private static double clamp(double v, double lo, double hi) { // keep a value between lo and hi
         return Math.max(lo, Math.min(hi, v)); // cap both ends
     }
